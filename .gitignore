@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+tlslite_poc/cert.pem
+tlslite_poc/key.pem
+# picotls is an upstream clone; we keep only our patch (picotls-integration/).
+picotls/
+# generated wire-byte artifacts (regenerate with `make captures`)
+captures/
+# compiled OpenSSL harness
+openssl-integration/svcaff_openssl
+/tmp/

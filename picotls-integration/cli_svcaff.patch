@@ -1,0 +1,155 @@
+diff --git a/lib/picotls.c b/lib/picotls.c
+index d2da8dd..974b80d 100644
+--- a/lib/picotls.c
++++ b/lib/picotls.c
+@@ -65,6 +65,10 @@
+ 
+ #define PTLS_HANDSHAKE_HEADER_SIZE 4
+ 
++/* service-affinity PoC (draft-wang-tls-service-affinity): when set, a server
++ * adds migration_allowed (0xFE4E) to its NewSessionTicket. */
++int ptls_svcaff_emit_migration_allowed = 0;
++
+ #define PTLS_EXTENSION_TYPE_SERVER_NAME 0
+ #define PTLS_EXTENSION_TYPE_STATUS_REQUEST 5
+ #define PTLS_EXTENSION_TYPE_SUPPORTED_GROUPS 10
+@@ -1930,6 +1934,8 @@ static int send_session_ticket(ptls_t *tls, ptls_message_emitter_t *emitter)
+             if (tls->ctx->max_early_data_size != 0)
+                 buffer_push_extension(emitter->buf, PTLS_EXTENSION_TYPE_EARLY_DATA,
+                                       { ptls_buffer_push32(emitter->buf, tls->ctx->max_early_data_size); });
++            if (ptls_svcaff_emit_migration_allowed)
++                buffer_push_extension(emitter->buf, 0xFE4E, {}); /* migration_allowed */
+         });
+     });
+ 
+@@ -5724,6 +5730,14 @@ static int handle_client_handshake_message(ptls_t *tls, ptls_message_emitter_t *
+         case PTLS_HANDSHAKE_TYPE_KEY_UPDATE:
+             ret = handle_key_update(tls, emitter, message);
+             break;
++        case 0xFD: { /* migrate_request (service-affinity PoC, draft-wang-tls-service-affinity) */
++            const uint8_t *p = message.base + PTLS_HANDSHAKE_HEADER_SIZE, *e = message.base + message.len;
++            uint16_t tlen = (p + 2 <= e) ? ((uint16_t)p[0] << 8 | p[1]) : 0;
++            int n = (p + 2 + tlen <= e) ? (int)tlen : 0;
++            fprintf(stderr, "[picotls] received migrate_request (0xFD) target=%.*s\n", n, (const char *)(p + 2));
++            ret = 0;
++            break;
++        }
+         default:
+             ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
+             break;
+@@ -6187,6 +6201,29 @@ Exit:
+     return ret;
+ }
+ 
++/* service-affinity PoC: emit a migrate_request post-handshake message (type
++ * 0xFD) into sendbuf. Body is uint16 target_len followed by the target. */
++int ptls_svcaff_send_migrate_request(ptls_t *tls, ptls_buffer_t *sendbuf, const char *target)
++{
++    struct st_ptls_record_message_emitter_t emitter;
++    int ret;
++    size_t tlen = target != NULL ? strlen(target) : 0;
++
++    init_record_message_emitter(tls, &emitter, sendbuf);
++    size_t orig_off = emitter.super.buf->off;
++
++    ptls_push_message(&emitter.super, NULL, 0xFD, {
++        ptls_buffer_push16(emitter.super.buf, (uint16_t)tlen);
++        ptls_buffer_pushv(emitter.super.buf, target, tlen);
++    });
++    ret = 0;
++
++Exit:
++    if (ret != 0)
++        emitter.super.buf->off = orig_off;
++    return ret;
++}
++
+ int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inlen)
+ {
+     assert(tls->traffic_protection.enc.aead != NULL);
+diff --git a/t/cli.c b/t/cli.c
+index 5939093..9192e03 100644
+--- a/t/cli.c
++++ b/t/cli.c
+@@ -78,6 +78,11 @@ static void setup_ptlslog(const char *fn)
+     ptls_log.may_include_appdata = 1;
+ }
+ 
++/* service-affinity PoC globals (used by both handle_connection and main) */
++static int svcaff_active = 0;
++extern int ptls_svcaff_emit_migration_allowed;
++extern int ptls_svcaff_send_migrate_request(ptls_t *tls, ptls_buffer_t *sendbuf, const char *target);
++
+ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server_name, const char *input_file,
+                              ptls_handshake_properties_t *hsprop, int request_key_update, int keep_sender_open)
+ {
+@@ -169,6 +174,9 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
+                             shift_buffer(&ptbuf, early_bytes_sent);
+                         if (request_key_update)
+                             ptls_update_key(tls, 1);
++                        /* service-affinity: server sends migrate_request post-handshake */
++                        if (svcaff_active && ptls_is_server(tls))
++                            ptls_svcaff_send_migrate_request(tls, &encbuf, "tok-B");
+                     } else if (ret == PTLS_ERROR_IN_PROGRESS) {
+                         /* ok */
+                     } else {
+@@ -439,6 +447,21 @@ static void usage(const char *cmd)
+     printf("\n\n");
+ }
+ 
++/* --- service-affinity PoC (draft-wang-tls-service-affinity) additions --- */
++/* migration_support extension, experimental code point 0xFE4D. */
++static int svcaff_on_extension_cb(ptls_on_extension_t *self, ptls_t *tls, uint8_t hstype, uint16_t exttype,
++                                  ptls_iovec_t extdata)
++{
++    const char *name = exttype == 0xFE4D ? "migration_support" : exttype == 0xFE4E ? "migration_allowed" : NULL;
++    if (name != NULL)
++        fprintf(stderr, "[picotls] observed %s (0x%04X) hstype=%u len=%zu\n", name, (unsigned)exttype, (unsigned)hstype,
++                extdata.len);
++    return 0;
++}
++static ptls_on_extension_t svcaff_on_extension = {svcaff_on_extension_cb};
++static ptls_raw_extension_t svcaff_exts[] = {{0xFE4D, {NULL, 0}}, {UINT16_MAX, {NULL, 0}}};
++/* --- end service-affinity additions --- */
++
+ int main(int argc, char **argv)
+ {
+     ERR_load_crypto_strings();
+@@ -463,17 +486,20 @@ int main(int argc, char **argv)
+     };
+     ptls_handshake_properties_t hsprop = {{{{NULL}}}};
+     const char *host, *port, *input_file = NULL, *psk_hash = "sha256";
+-    int is_server = 0, use_early_data = 0, request_key_update = 0, keep_sender_open = 0, ch;
++    int is_server = 0, use_early_data = 0, request_key_update = 0, keep_sender_open = 0, svcaff = 0, ch;
+     struct sockaddr_storage sa;
+     socklen_t salen;
+     int family = 0;
+     const char *raw_pub_key_file = NULL, *cert_location = NULL;
+ 
+-    while ((ch = getopt(argc, argv, "46abBC:c:i:Ij:k:nN:es:Sr:p:P:E:K:l:T:uy:vV:h")) != -1) {
++    while ((ch = getopt(argc, argv, "46abBC:c:i:Ij:k:MnN:es:Sr:p:P:E:K:l:T:uy:vV:h")) != -1) {
+         switch (ch) {
+         case '4':
+             family = AF_INET;
+             break;
++        case 'M': /* service-affinity: emit (client) and observe migration_support */
++            svcaff = 1;
++            break;
+         case '6':
+             family = AF_INET6;
+             break;
+@@ -685,6 +711,14 @@ int main(int argc, char **argv)
+         }
+         ctx.pre_shared_key.hash = cipher_suites[i]->hash;
+     }
++    if (svcaff) {
++        ctx.on_extension = &svcaff_on_extension;
++        if (!is_server)
++            hsprop.additional_extensions = svcaff_exts;
++        svcaff_active = 1;
++        ptls_svcaff_emit_migration_allowed = 1; /* server NST carries migration_allowed */
++    }
++
+     if (argc != 2) {
+         fprintf(stderr, "missing host and port\n");
+         return 1;
