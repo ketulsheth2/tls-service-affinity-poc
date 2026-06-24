@@ -7,6 +7,9 @@ It puts the `migration_support` extension on the wire as a genuine TLS
 extension and uses real TLS 1.3 cross-instance resumption — not an
 application-level model.
 
+The Internet-Draft this implements is included in the repo:
+[`draft-wang-tls-service-affinity-03.txt`](draft-wang-tls-service-affinity-03.txt).
+
 ## Status (honest)
 
 | Item | Stack | Status |
@@ -98,6 +101,7 @@ tlslite_poc/migrate_request_wire.py  focused proof: migrate_request as a real po
 tlslite_poc/fs_enforcement.py  forward-secrecy enforcement (psk_dhe_ke required)
 tlslite_poc/_smoke.py          minimal resumption check
 openssl-integration/           OpenSSL custom-ext harness + run script (mainstream stack)
+draft-wang-tls-service-affinity-03.txt   the Internet-Draft this code implements
 tlslite_poc/interop_server.py  tlslite server for cross-stack interop
 tlslite_poc/interop_client.py  tlslite client for cross-stack interop
 tlslite_poc/captures.py        write real wire bytes to captures/

@@ -1,0 +1,639 @@
+TLS Working Group                                                W. Wang
+Internet-Draft                                                   A. Wang
+Intended status: Standards Track                           China Telecom
+Expires: 23 December 2026                                        Z. Wang
+                                  Beijing Infosec Technologies Co., LTD.
+                                                                M. Sahni
+                                                                K. Sheth
+                                                      Palo Alto Networks
+                                                            23 June 2026
+
+
+   Authorized TLS 1.3 Session Resumption on an Alternate Server Instance
+                   draft-wang-tls-service-affinity-03
+
+Abstract
+
+   This document defines a minimal mechanism by which a TLS 1.3 server
+   instance can authorize a client to resume an existing session on a
+   different instance of the same service (for example, another node of
+   a load-balanced cluster), and can request, in band, that the client
+   do so. The authorization is carried inside the server's own session
+   ticket and therefore inherits the security properties of TLS 1.3
+   ticket-based resumption [RFC8446]. On the wire this document adds only
+   a client capability extension, a flag marking a ticket eligible for
+   relocation, and a post-handshake message requesting relocation to an
+   opaque, application-resolved target. The mechanism deliberately
+   provides no transport-layer connection mobility, no IP address
+   resolution, and no application-layer data reliability; recovery of
+   in-flight application data remains an application responsibility.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79. It will expire on 23 December 2026.
+
+Table of Contents
+
+   1.  Introduction
+   2.  Conventions
+   3.  Problem Statement and Trust Model
+   4.  Relationship to Existing Mechanisms
+   5.  Protocol Elements
+   6.  Procedures
+   7.  Use Case: Computing-Aware Traffic Steering (CATS)
+   8.  Message Flow
+   9.  Code Points and IANA Considerations
+   10. Security Considerations
+   11. Privacy Considerations
+   12. Implementation Status
+   13. References
+   Appendix A.  Changes from draft-wang-tls-service-affinity-02
+
+1.  Introduction
+
+   Services are frequently deployed as clusters of instances that share
+   the keying material needed to resume TLS sessions (a shared
+   ticket-encryption key, or a shared PSK store). Operational events --
+   node maintenance, autoscaling, computing-aware traffic steering, or
+   rebalancing -- create a need to relocate an established client session
+   from one instance to another without a full re-authentication and
+   without pinning per-session state in the network.
+
+   TLS 1.3 [RFC8446] already lets a client resume a session on any
+   instance that can recover the session. Two things are missing, and
+   this document supplies exactly those:
+
+   1.  a server-controlled way to mark a session as eligible for
+       relocation to a sibling instance, bound to that session; and
+   2.  an authenticated, in-band way for the server to request that the
+       client relocate, optionally naming where to go.
+
+   Everything else reuses unmodified TLS 1.3 resumption.
+
+1.1.  Non-goals (explicitly out of scope)
+
+   *  Transport mobility. This is not QUIC-style connection migration
+      [RFC9000]; no transport connection is preserved (Section 4).
+   *  Addressing. TLS does not carry or resolve IP addresses. The target
+      is an opaque identifier resolved by the application/control plane
+      (Section 5.3).
+   *  Application data reliability / session continuity. Preserving or
+      replaying in-flight application data across relocation is an
+      application concern and is NOT specified here (Section 8, Fig. B).
+   *  Cross-domain relocation. Relocation to a different server identity
+      or trust domain MUST NOT use this mechanism.
+
+1.2.  What is genuinely new (and why it must live in TLS)
+
+   The cryptographic ability to resume at a sibling already exists when a
+   cluster shares resumption keys. This document does not add new
+   resumption cryptography. Its contribution is a primitive that does not
+   exist in TLS today and cannot be synthesized at the application layer:
+
+   *  An authenticated, in-band, server-to-client signal that authorizes
+      and requests resuming THIS cryptographic session on a named
+      sibling, plus capability negotiation that the peer supports it.
+
+   This is irreducibly a TLS-layer function for two reasons. First, the
+   relocation authorization is bound to TLS keying material (the
+   resumption secret), which the application layer never sees and so
+   cannot bind to or govern. Second, the signal is protocol-agnostic:
+   HTTP has application-layer relocation signals, but the many non-HTTP
+   protocols carried over TLS have none. Session DATA continuity, by
+   contrast, IS an application concern and is deliberately excluded
+   (Section 1.1).
+
+1.3.  Applicability
+
+   This mechanism targets long-lived TLS sessions -- often non-HTTP --
+   that an operator may need to steer to a specific instance while they
+   are in progress. Examples include streaming inference / LLM sessions,
+   messaging and presence (e.g. XMPP or MQTT over TLS), and long-running
+   database or gRPC streams, especially under computing-aware traffic
+   steering [I-D.ietf-cats-usecases-requirements].
+
+   It is NOT intended for short request/response workloads. Where a client
+   naturally reconnects between requests (as with typical HTTP),
+   terminating the connection and letting the client reconnect -- steered
+   by DNS or a load balancer and resumed cheaply via a shared ticket -- is
+   simpler and SHOULD be preferred (see Section 4.3). Deployments SHOULD
+   use this mechanism only where in-session, operator-chosen relocation
+   provides a concrete benefit over reconnection.
+
+2.  Conventions
+
+   The key words MUST, MUST NOT, SHALL, SHOULD, MAY, etc. are to be
+   interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only
+   when, they appear in all capitals. The TLS presentation language of
+   [RFC8446] is used.
+
+3.  Problem Statement and Trust Model
+
+   A client establishes a TLS 1.3 session with instance A of a service.
+   The operator needs to relocate that session to instance B of the SAME
+   service (same server identity, e.g. same certificate name) while
+   preserving TLS's authentication and confidentiality guarantees and
+   without DNS/HTTP redirection latency or middlebox session pinning.
+
+   The trust domain is the set of instances of one administrative service
+   that share the resumption keying material required to accept the
+   session. This sharing is already a prerequisite for ordinary
+   resumption across a cluster; this document introduces no new
+   key-distribution requirement.
+
+4.  Relationship to Existing Mechanisms
+
+   *  QUIC connection migration [RFC9000]. Preserves one transport
+      connection across paths between the same endpoints. This document
+      does not preserve a connection and does not change endpoints
+      transparently; it authorizes resumption on a different instance
+      over a new connection. Deployments able to use QUIC SHOULD consider
+      it; this targets TLS-over-TCP deployments that cannot.
+   *  Plain ticket resumption [RFC8446]. A cluster sharing ticket keys
+      can already resume on any node. This document adds operator
+      authorization (the session is marked migratable, optionally scoped)
+      and an authenticated in-band request to relocate; it does not alter
+      the resumption handshake.
+   *  DTLS Connection ID [RFC9146]. Addresses datagram association under
+      address change; complementary, not overlapping.
+
+4.1.  Why a TLS-layer mechanism rather than an application-layer signal
+
+   It is reasonable to ask why relocation is signaled at the TLS layer
+   rather than by an application-layer mechanism such as HTTP Alternative
+   Services [RFC7838] or SVCB/HTTPS records [RFC9460]. Those mechanisms
+   are effective and, for HTTP, can convey "reach this origin elsewhere."
+   This document does not replace them. It closes two gaps they do not:
+
+   1.  Protocol independence. Alt-Svc and SVCB are HTTP/DNS mechanisms. A
+       large class of services runs directly over TLS without HTTP
+       (messaging, mail, database, bespoke RPC) and has no common
+       application-layer relocation signal. A TLS-layer mechanism serves
+       all of them uniformly.
+   2.  Coupling to resumption authorization. This mechanism does not
+       merely point the client elsewhere; it authorizes a specific
+       session to be resumed on a sibling and is validated as part of the
+       resumption handshake there. The authorization travels inside the
+       server's ticket and the request inside the authenticated channel,
+       so neither can be injected or redirected by a network
+       intermediary, independent of the application protocol. An
+       application-layer redirect cannot provide this: it has no access
+       to the resumption secret and so cannot bind the redirection to the
+       TLS session.
+
+   Server authentication at the new instance is provided by TLS itself
+   (PSK binder and/or certificate), exactly as for any resumed
+   connection; this document does not change that. Application-layer
+   signaling remains compatible and MAY be used alongside this mechanism;
+   purely-HTTP deployments already relying on Alt-Svc/SVCB may have no
+   need for it.
+
+4.2.  In scope vs. out of scope
+
+   In TLS's domain (this document): negotiating the capability; marking a
+   session relocatable; the authenticated in-band request to relocate;
+   and the resumption that binds the relocation to the session keys.
+
+   Out of scope (application/control plane): resolving the opaque target
+   to an endpoint; deciding whether/when to relocate; and any recovery of
+   in-flight application data.
+
+4.3.  Why not close the connection and let the client reconnect?
+
+   A server can already terminate a session with close_notify and rely on
+   the client to reconnect, where DNS or a load balancer directs it to a
+   healthy instance and a shared ticket makes the reconnect a cheap
+   resumption. That pattern requires no new code points and SHOULD be
+   preferred for short, request/response workloads.
+
+   It is inadequate when: (a) the session is long-lived and the operator
+   must steer it to a SPECIFIC instance chosen at that moment, which DNS
+   and load balancers cannot target without per-flow state; (b)
+   reconnection latency (DNS resolution, fresh path setup) is on the
+   critical path; or (c) the protocol is not HTTP and has no
+   application-layer relocation signal. This mechanism provides an
+   in-band, operator-chosen, protocol-agnostic relocation for those cases
+   without pinning per-flow state in the network.
+
+5.  Protocol Elements
+
+   The normative, interoperable surface of this document is small and
+   intentional: the two extensions defined in Sections 5.1 and 5.2, the
+   migrate_request message of Section 5.3, and their processing rules. The
+   internal format of the server's session ticket -- which carries the
+   actual relocation authorization and any scope -- is deliberately NOT
+   standardized; it is server-private state, recoverable only by instances
+   that already share the resumption keys.
+
+5.1.  migration_support extension (ClientHello)
+
+   Zero-length; signals client support.
+
+           struct {} MigrationSupport;
+
+   A server MUST NOT mark a ticket migratable (Section 5.2) or send a
+   migrate_request (Section 5.3) for a connection whose ClientHello did
+   not contain migration_support.
+
+5.2.  migration_allowed ticket extension (NewSessionTicket)
+
+   A zero-length extension placed in the extensions field of a
+   NewSessionTicket [RFC8446, Section 4.6.1] indicating that this ticket
+   MAY be presented to a sibling instance under this mechanism.
+
+           struct {} MigrationAllowed;
+
+   The authorization data itself -- that the session may be relocated,
+   and any operator-defined scope limiting which instances may accept it
+   -- is carried INSIDE the opaque ticket, which is encrypted and
+   integrity-protected by the issuing service and recoverable by any
+   sibling that can already resume the session. The internal ticket
+   format is a server implementation matter and is not standardized. The
+   client treats the ticket as opaque per [RFC8446]. The authorization's
+   validity is bounded by the ticket's existing lifetime
+   (ticket_lifetime); no separate expiry field is defined.
+
+5.3.  migrate_request post-handshake message
+
+   A new post-handshake handshake message (HandshakeType TBD3; see
+   Section 9), sent by the server over the established, authenticated
+   channel to request relocation.
+
+           struct {
+               opaque target<0..2^16-1>;  /* opaque; empty = client uses
+                                             its own policy */
+           } MigrateRequest;
+
+   target is opaque to TLS and resolved to a concrete endpoint by the
+   application or control plane. Because it travels inside the encrypted,
+   authenticated channel, it is confidential and unforgeable to network
+   attackers, and it MAY be chosen at request time (enabling real-time
+   instance selection).
+
+5.4.  migrate_request state-machine semantics
+
+   *  A server MAY send migrate_request only AFTER the handshake has
+      completed (i.e. once it would be permitted to send a
+      NewSessionTicket), and only on a connection whose ClientHello
+      contained migration_support. A server MUST NOT send it during the
+      handshake or as 0-RTT/early data. A server MAY send more than one
+      (e.g. to update the target).
+   *  A client that offered migration_support and is in the
+      post-handshake state MUST accept migrate_request. Receipt is NOT an
+      error and does NOT by itself invalidate the current connection. A
+      client that did NOT offer migration_support MUST treat receipt as
+      an unexpected_message alert.
+   *  migrate_request is independent of NewSessionTicket and KeyUpdate
+      and MAY be interleaved with them in any order; implementations MUST
+      continue to process NewSessionTickets normally so resumption keying
+      material is retained. migrate_request does not change traffic keys
+      and is not part of any transcript affecting a Finished MAC.
+   *  On receipt, a client SHOULD initiate Phase 3 (Section 6.3) but MAY
+      defer or decline per local policy. Because acting is optional and a
+      client that ignores it simply continues with its current server,
+      the mechanism is backward compatible.
+
+6.  Procedures
+
+6.1.  Phase 1 -- Handshake and authorization
+
+   1.  Client sends ClientHello with migration_support.
+   2.  Instance A completes a normal TLS 1.3 handshake (certificate
+       authentication as usual).
+   3.  For a session it wishes to make relocatable, Instance A issues a
+       NewSessionTicket whose extensions include migration_allowed, and
+       encodes the relocation authorization (and any scope) inside the
+       opaque ticket.
+
+6.2.  Phase 2 -- Migration request (optional, server-initiated)
+
+   Instance A sends migrate_request, optionally naming an opaque target.
+   The client MAY act immediately, defer, or decline per local policy.
+
+6.3.  Phase 3 -- Resumption on instance B
+
+   1.  The client resolves target (or applies its own policy) to a
+       concrete endpoint that MUST represent the same server identity as
+       the original session.
+   2.  The client opens a new TLS 1.3 connection and performs standard
+       PSK-based resumption [RFC8446], presenting the migration_allowed
+       ticket in pre_shared_key. To preserve forward secrecy, both peers
+       MUST use the psk_dhe_ke mode; the psk_ke (PSK-only) mode MUST NOT
+       be used for relocation. No migration-specific data is sent in the
+       ClientHello.
+   3.  Instance B recovers the session from the ticket (or PSK store),
+       confirms from the ticket that the session is authorized for
+       relocation and that B is within any encoded scope, and completes
+       the PSK handshake. Mutual possession of the resumption secret is
+       proven by the client PSK binder and B's Finished, as in [RFC8446].
+   4.  If the ticket does not authorize relocation, if B is out of scope,
+       or if PSK validation fails, B MUST NOT apply migration semantics
+       and proceeds per normal resumption/full-handshake rules.
+
+6.4.  Interaction with 0-RTT and ticket reuse
+
+   This mechanism changes neither 0-RTT nor ticket-reuse behavior. All
+   anti-replay requirements of Section 8 of [RFC8446] continue to apply
+   unchanged. Applications MUST NOT send non-idempotent data in 0-RTT.
+
+7.  Use Case: Computing-Aware Traffic Steering (CATS)
+
+   In CATS [I-D.ietf-cats-usecases-requirements] an operator steers
+   sessions to compute instances by real-time load. After the initial
+   handshake, the operator relocates a session by sending migrate_request
+   with an opaque target selected at that moment; the control plane
+   resolves it to the currently optimal instance. Instance selection thus
+   reflects conditions at migration time, while the TLS layer remains
+   unaware of topology and addressing. A connection close plus client
+   reconnect cannot achieve the same real-time, in-band steering without
+   incurring DNS/redirect latency and losing the chosen target.
+
+8.  Message Flow
+
+   Figure A shows the control flow. Figure B shows that in-flight
+   application data is the application's responsibility, not TLS's.
+
+   Figure A: control flow
+
+   Client                         Instance A                Instance B
+     |  ClientHello + key_share                                  |
+     |   + migration_support  ------>|                           |
+     |        ServerHello + key_share|                           |
+     |        {EncryptedExtensions}  |                           |
+     |        {Certificate}          |                           |
+     |        {CertificateVerify}    |                           |
+     |  <-----------{Finished}       |                           |
+     |  {Finished} ----------------->|                           |
+     |  <--- NewSessionTicket        |                           |
+     |        + migration_allowed    | (auth inside opaque ticket)|
+     |  <===== application data =====>|                           |
+     |  <--- migrate_request         | (post-handshake, encrypted,|
+     |        {opaque target}        |  OPTIONAL)                 |
+     |  close_notify --------------->|                           |
+     |  -- resolve target via app/control plane -->              |
+     |  ClientHello + pre_shared_key (A's ticket, psk_dhe_ke) --->|
+     |                                 ServerHello + pre_shared_key|
+     |                                 {EncryptedExtensions}      |
+     |  <-------------------------------------{Finished}         |
+     |  {Finished} -------------------------------------------->|
+     |  (B recovers session; confirms migration_allowed + scope) |
+     |  <================ application data ====================> |
+
+   No Certificate/CertificateVerify on the B leg: it is PSK resumption. A
+   server outside the trust domain cannot produce a valid Finished, so
+   the handshake fails closed (Section 10). A client that did not send
+   migration_support, or that ignores migrate_request, simply continues
+   with Instance A (backward-compatible).
+
+   Figure B: in-flight application data (the "make-payment" case)
+
+   Application (client)   TLS (client)      Instance A      Instance B
+     | POST /make-payment   |                  |                |
+     |  (Idempotency-Key: K) |                 |                |
+     |--------------------->| app data ------->|                |
+     |                      |  <-- migrate_request (A SHOULD     |
+     |                      |       drain outstanding exchanges  |
+     |                      |       first)                       |
+     |  <-- MIGRATION event -|                 |                |
+     |   (TLS does NOT buffer|  close_notify -->|                |
+     |    or replay data)    |                                  |
+     |                      |  resume (PSK) ------------------->|
+     |                      |  <-------------- handshake done    |
+     | re-issue POST         |                                  |
+     |  /make-payment        |                                  |
+     |  (Idempotency-Key: K) |                                  |
+     |--------------------->| app data ----------------------->|
+     |                      |   (B/backend deduplicates on K)   |
+     |  <-- 200 OK ---------|<--------------------------------- |
+
+   TLS surfaces a migration event; the APPLICATION decides whether to
+   re-issue the request and uses its own idempotency mechanism so a
+   request processed by A is not double-applied by B. TLS neither buffers
+   nor replays application data across the relocation boundary.
+
+9.  Code Points and IANA Considerations
+
+   This document requests the following assignments. The values below are
+   experimental placeholders used by the proof-of-concept implementations
+   (Section 12) and MUST be replaced by IANA-assigned values; they MUST
+   NOT be shipped in production until assigned.
+
+   +---------------------+--------------------------+-------+-------------------------+
+   | Element             | Registry                 | PoC   | IANA policy             |
+   +---------------------+--------------------------+-------+-------------------------+
+   | migration_support   | TLS ExtensionType Values | 0xFE4D| Specification Required  |
+   | migration_allowed   | TLS ExtensionType Values | 0xFE4E| Specification Required  |
+   | migrate_request     | TLS HandshakeType        | 0xFD  | IETF Review (see below) |
+   +---------------------+--------------------------+-------+-------------------------+
+
+   Note on the HandshakeType value: unlike some registries, the TLS
+   HandshakeType registry has NO "Reserved for Private Use" range -- every
+   value is assigned by IANA. The value 0xFD (253) used by the PoC is
+   currently unassigned but choosing it for experiments risks a future
+   collision (254 is already message_hash). The value is therefore TBD and
+   MUST be assigned by IANA.
+
+   IANA is requested to assign:
+
+   *  Two values in the "TLS ExtensionType Values" registry:
+      migration_support (ClientHello) and migration_allowed
+      (NewSessionTicket), reference set to this document.
+   *  One value in the "TLS HandshakeType" registry: migrate_request
+      (post-handshake), reference set to this document.
+
+10. Security Considerations
+
+10.1.  Threat model
+
+   The mechanism operates within a single trust domain: a set of server
+   instances of one administrative service that share the resumption
+   keying material needed to accept a session. This sharing is already a
+   prerequisite for ordinary TLS 1.3 resumption across a cluster; this
+   document adds no new key-distribution requirement.
+
+   Adversaries considered:
+
+   *  On-path network attacker: may observe, drop, reorder, delay, and
+      inject records, but cannot break TLS 1.3 and holds no private or
+      shared resumption keys.
+   *  Off-path attacker: may inject spoofed packets only.
+   *  Malicious client: holds a legitimate session and attempts to be
+      relocated to an instance it should not reach, to replay a
+      relocation authorization, or to exhaust resources.
+   *  Foreign server: a TLS server outside the trust domain (no shared
+      resumption keys) to which a client might be steered (DNS poisoning,
+      BGP hijack, a compromised control plane, or a malicious
+      application-layer redirect).
+
+   Out of scope (pre-existing assumptions of cluster resumption):
+   compromise of an in-domain instance or of the shared resumption keys
+   (either already defeats ticket-based resumption generally); and
+   recovery of in-flight application data (an application concern).
+
+10.2.  Security goals
+
+   1.  Relocation authorization integrity: an attacker MUST NOT cause a
+       client to treat a session as relocatable, or alter the permitted
+       instances, without detection.
+   2.  Trust-domain authentication (anti-redirection): a client that acts
+       on a relocation MUST end up resuming on an instance within the
+       trust domain; a foreign server MUST NOT complete the relocation.
+   3.  Request authenticity: a relocation request MUST be attributable to
+       the server of the current authenticated session and MUST NOT be
+       forgeable or injectable by network attackers.
+   4.  Freshness / replay bound: reuse of a relocation authorization MUST
+       be bounded by the same policy that bounds ticket reuse.
+   5.  Forward secrecy: data exchanged after relocation MUST remain
+       confidential even if the shared resumption key is later
+       compromised.
+   6.  No new linkability: the mechanism MUST NOT add cross-connection
+       linkability beyond TLS 1.3 ticket resumption.
+
+10.3.  How the design meets the goals
+
+   *  Goals 1 and 4. Whether a session is relocatable and any scope is
+      carried inside the server's ticket, which is encrypted,
+      integrity-protected, and already bound to the session by [RFC8446].
+      A client or network attacker can neither forge nor modify it. No new
+      key schedule is introduced. Reuse is bounded by the server's
+      existing RFC 8446 Section 8 anti-replay and ticket_lifetime policy;
+      no new distributed anti-replay state is required.
+   *  Goal 2. Phase 3 is ordinary PSK resumption. Only an instance holding
+      the session's resumption keys can recover the session and produce a
+      valid Finished; a foreign server cannot, so the client's normal
+      resumption verification fails and the client MUST abort without
+      sending application data (fail-closed). This provides, at the TLS
+      layer, the anti-redirection assurance that path validation provides
+      in QUIC. This is an inherited property of RFC 8446 resumption, not a
+      new cryptographic guarantee introduced by this document.
+   *  Goal 3. migrate_request is a post-handshake message inside the
+      established, authenticated, encrypted channel; it inherits TLS
+      record-layer authenticity and carries no secret.
+   *  Goal 5. Relocation MUST use psk_dhe_ke; psk_ke MUST NOT be used.
+      Each relocated session establishes fresh (EC)DHE keys.
+   *  Goal 6. The client sends no migration-specific secret in cleartext;
+      Phase 3 is ordinary PSK resumption.
+
+10.4.  Residual risks
+
+   *  Target resolution. The target is opaque to TLS and resolved by the
+      application/control plane; regardless of how it is resolved, an
+      endpoint that cannot complete the resumption is rejected (Goal 2).
+      Implementations SHOULD still validate that the resolved endpoint
+      represents the same server identity as the original session.
+   *  Downgrade. migration_support is in the ClientHello and covered by
+      the handshake transcript; a network attacker that strips or alters
+      it causes the handshake to fail (absent a valid server certificate,
+      out of scope), so the feature cannot be silently downgraded. At
+      worst it is simply not offered, which is fail-safe.
+   *  0-RTT. If a client uses 0-RTT on the relocated connection, the
+      anti-replay requirements of Section 8 of [RFC8446] apply unchanged.
+   *  Denial of service. Verifying a relocation costs one session recovery
+      plus the normal resumption handshake. Instances SHOULD rate-limit
+      failed relocation attempts per source.
+
+10.5.  What a formal analysis should establish
+
+   The mechanism reuses the RFC 8446 key schedule unchanged, so the
+   analysis delta is small: (1) authenticity / non-injectability of
+   migrate_request given the TLS 1.3 record-layer guarantees; (2) that a
+   relocated session is accepted only by a holder of the resumption key
+   (resumption soundness is unchanged); (3) that migration_allowed and
+   any scope cannot be forged or modified by a client or network
+   attacker; and (4) that forward secrecy holds under psk_dhe_ke. A
+   symbolic analysis building on existing TLS 1.3 models is appropriate.
+
+11. Privacy Considerations
+
+   The client sends no migration-specific data in cleartext: Phase 3 is
+   ordinary PSK resumption, so this mechanism adds no linkability beyond
+   that already inherent in TLS 1.3 ticket resumption. The opaque target
+   travels only inside the encrypted channel. Operators SHOULD avoid
+   encoding identifying information in ticket contents beyond what
+   resumption already requires, and SHOULD consider Encrypted Client
+   Hello [I-D.ietf-tls-esni] where ClientHello/SNI privacy is desired.
+
+12. Implementation Status
+
+   [Note to RFC Editor: please remove this section before publication,
+   per RFC 7942.]
+
+   Three independent implementations interoperate on the wire elements of
+   this document:
+
+   *  tlslite-ng (Python): emits/observes migration_support; emits/reads
+      migration_allowed in NewSessionTicket; sends/receives migrate_request
+      as a real post-handshake message; enforces psk_dhe_ke (refuses
+      psk_ke); demonstrates cross-instance resumption and fail-closed
+      behavior against a foreign instance.
+   *  picotls (C): emits/observes migration_support via additional
+      extensions / on_extension; emits migration_allowed in its
+      NewSessionTicket; sends and receives migrate_request.
+   *  OpenSSL 3.x (C, mainstream): emits/observes migration_support via the
+      SSL_CTX_add_custom_ext API.
+
+   Interoperability achieved: all three wire elements interoperate both
+   directions between tlslite-ng and picotls; migration_support
+   interoperates both directions between OpenSSL and tlslite-ng. The
+   implementations and a runnable interop harness are available at
+   <https://github.com/ketulsheth2/tls-service-affinity-poc>. Maturity: research /
+   proof-of-concept. The experimental code points (Section 9) MUST NOT be
+   used in production.
+
+13. References
+
+13.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC 2119
+              Key Words", BCP 14, RFC 8174, May 2017.
+   [RFC8446]  Rescorla, E., "The Transport Layer Security (TLS) Protocol
+              Version 1.3", RFC 8446, August 2018.
+   [RFC9146]  Rescorla, E., et al., "Connection Identifier for DTLS 1.2",
+              RFC 9146, 2022.
+
+13.2.  Informative References
+
+   [RFC7838]  Nottingham, M., et al., "HTTP Alternative Services",
+              RFC 7838, April 2016.
+   [RFC9000]  Iyengar, J., Thomson, M., "QUIC: A UDP-Based Multiplexed and
+              Secure Transport", RFC 9000, May 2021.
+   [RFC9460]  Schwartz, B., et al., "Service Binding and Parameter
+              Specification via the DNS (SVCB and HTTPS RRs)", RFC 9460,
+              November 2023.
+   [I-D.ietf-cats-usecases-requirements]
+              Yao, K., et al., "Computing-Aware Traffic Steering (CATS)
+              Problem Statement, Use Cases, and Requirements", WiP.
+   [I-D.ietf-tls-esni]
+              Rescorla, E., et al., "TLS Encrypted Client Hello", WiP.
+
+Appendix A.  Changes from draft-wang-tls-service-affinity-02
+
+   *  Removed the Reliable Framing Layer in its entirety; recovery of
+      in-flight application data is now explicitly out of scope.
+   *  Removed IP addresses from all TLS structures; the target is now an
+      opaque identifier resolved by the application/control plane.
+   *  Moved the migration authorization into the server's opaque ticket,
+      so security inherits from RFC 8446 resumption; no new key schedule
+      and no migration-specific secret on the wire.
+   *  Replaced the migrate_notify alert with a migrate_request
+      post-handshake message carrying an optional dynamic target, with
+      defined state-machine semantics (Section 5.4).
+   *  Added Threat Model, Security Goals, the forward-secrecy requirement
+      (psk_dhe_ke), Privacy Considerations, and an Implementation Status
+      section.
+   *  Added "Relationship to Existing Mechanisms" and "Why a TLS-layer
+      mechanism" sections, and a Code Points / IANA section noting the
+      HandshakeType assignment policy.
+   *  Added an Applicability statement (Section 1.3), a "why not close and
+      reconnect?" comparison (Section 4.3), an explicit statement of the
+      normative surface (Section 5), and clarified that the
+      anti-redirection property is inherited from RFC 8446 resumption.
+   *  Corrected handshake diagrams (removed spurious ChangeCipherSpec).
+
+Authors' Addresses
+
+   Wei Wang, Aijun Wang (China Telecom); Zongbin Wang (Beijing Infosec
+   Technologies Co., Ltd.); Mohit Sahni, Ketul Sheth (Palo Alto Networks).
