@@ -3,9 +3,9 @@
 This PoC demonstrates the draft's **real TLS wire elements** in independent TLS
 stacks, following how the WG validated ECH (real wire bytes + interop, RFC 7942).
 
-It complements the application-level explainer in `../` (Go) by putting the
-`migration_support` extension on the wire as a genuine TLS extension and using
-real TLS 1.3 cross-instance resumption.
+It puts the `migration_support` extension on the wire as a genuine TLS
+extension and uses real TLS 1.3 cross-instance resumption — not an
+application-level model.
 
 ## Status (honest)
 
